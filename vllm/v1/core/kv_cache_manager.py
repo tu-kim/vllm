@@ -166,6 +166,7 @@ class KVCacheManager:
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        self.pi_pool = self.coordinator.pi_pool  # ComposableKV; None if disabled
         self.kv_cache_config = kv_cache_config
 
         # Watermark: minimum number of KV cache blocks to keep free when
@@ -192,6 +193,11 @@ class KVCacheManager:
         # Off-table cow blocks handed to a KV connector for partial-tail
         # offload; pinned until the request's blocks are freed.
         self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
+
+    @property
+    def pi_usage(self) -> float:
+        """ComposableKV: PI pool usage (0.0 when there is no PI pool)."""
+        return self.pi_pool.get_usage() if self.pi_pool is not None else 0.0
 
     @property
     def usage(self) -> float:

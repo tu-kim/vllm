@@ -274,6 +274,20 @@ class Scheduler(SchedulerInterface):
         if hash_block_size is None:
             hash_block_size = block_size
         self.hash_block_size = hash_block_size
+        # ComposableKV: split the GPU blocks into a prefix pool and a PI pool.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        pi_pool_ratio = float(
+            kv_transfer_config.get_from_extra_config("ckv_pi_pool_ratio", 0.0)
+            if kv_transfer_config is not None
+            else 0.0
+        )
+        if pi_pool_ratio > 0:
+            assert 0 < pi_pool_ratio < 1, f"ckv_pi_pool_ratio={pi_pool_ratio}"
+            kv_cache_config.num_pi_blocks = int(kv_cache_config.num_blocks * pi_pool_ratio)
+            logger.info(
+                "ComposableKV PI pool: %d of %d blocks (ratio %.2f)",
+                kv_cache_config.num_pi_blocks, kv_cache_config.num_blocks, pi_pool_ratio,
+            )
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,

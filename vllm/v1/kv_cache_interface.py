@@ -970,6 +970,9 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    num_pi_blocks: int = 0
+    """ComposableKV: blocks at the top of the id range reserved for the
+    position-independent KV pool (vllm.v1.core.ckv_pi_pool). 0 disables it."""
 
     @property
     def has_mamba_layers(self) -> bool:

@@ -8,6 +8,7 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.ckv_pi_pool import PiPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -94,8 +95,23 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
+        # ComposableKV: the top `num_pi_blocks` block ids form a separate pool.
+        num_pi_blocks = kv_cache_config.num_pi_blocks
+        assert 0 <= num_pi_blocks < kv_cache_config.num_blocks - 1, (
+            f"num_pi_blocks={num_pi_blocks} must leave prefix blocks "
+            f"(num_blocks={kv_cache_config.num_blocks})"
+        )
+        self.pi_pool: PiPool | None = (
+            PiPool(
+                first_block_id=kv_cache_config.num_blocks - num_pi_blocks,
+                num_blocks=num_pi_blocks,
+                block_size=scheduler_block_size,
+            )
+            if num_pi_blocks > 0
+            else None
+        )
         self.block_pool = BlockPool(
-            num_gpu_blocks=kv_cache_config.num_blocks,
+            num_gpu_blocks=kv_cache_config.num_blocks - num_pi_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
