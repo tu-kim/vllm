@@ -1014,15 +1014,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+        resync = reqs.resync_num_computed_tokens
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
             num_computed_tokens_np[req_index] = num_computed_tokens
+            if req_id in resync:
+                # ComposableKV: the scheduler moved the computed boundary past
+                # shared PI blocks. The device-side counter only ever advances
+                # by the tokens this runner computed, so reload it.
+                self.req_states.num_computed_tokens.stage_write_elem(
+                    req_index, num_computed_tokens
+                )
             if req_new_block_ids is not None:
                 self.block_tables.append_block_ids(
                     req_index, req_new_block_ids, overwrite=False
                 )
+        if resync:
+            self.req_states.num_computed_tokens.apply_write()
 
         # Update CPU num_computed_prefill_tokens.
         np.minimum(

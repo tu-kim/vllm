@@ -108,6 +108,9 @@ def test_segmented_prefill_splices_pi_blocks(scheduler):
     cached = out2.scheduled_cached_reqs
     i = cached.req_ids.index(req.request_id)
     assert cached.num_computed_tokens[i] == PI_END  # what the model runner sees
+    # MRV2 keeps a device-side counter that only grows by computed tokens:
+    # the splice must be flagged so it reloads the value (once).
+    assert cached.resync_num_computed_tokens == {req.request_id}
     entry = pi.lookup(PiKey("c", 0))
     pi_ids = [b.block_id for b in entry.blocks]
     new_ids = cached.new_block_ids[i][0]
@@ -122,6 +125,19 @@ def test_segmented_prefill_splices_pi_blocks(scheduler):
     assert entry.ref_cnt == 0 and PiKey("c", 0) in pi.entries
     assert km.block_pool.get_num_free_blocks() == km.block_pool.num_gpu_blocks - 1
     assert all(b.ref_cnt == 1 for b in entry.blocks)
+
+
+def test_resync_flag_is_sent_only_once(scheduler):
+    req = create_requests(1, num_tokens=PROMPT, block_size=BLOCK, max_tokens=4)[0]
+    scheduler.connector.plan_reqs.add(req.request_id)
+    scheduler.add_request(req)
+    outs = run_prefill(scheduler, req)
+    flagged = [o.scheduled_cached_reqs.resync_num_computed_tokens for o in outs]
+    assert flagged == [set(), {req.request_id}]
+    # decode steps: no flag
+    out = scheduler.schedule()
+    assert out.scheduled_cached_reqs.resync_num_computed_tokens == set()
+    scheduler.update_from_output(out, step_output([req], finished=True))
 
 
 def test_second_request_hits_the_whole_prefix_through_pi_blocks(scheduler):

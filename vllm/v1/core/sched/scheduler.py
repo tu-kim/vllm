@@ -277,6 +277,9 @@ class Scheduler(SchedulerInterface):
         self.hash_block_size = hash_block_size
         # ComposableKV: split the GPU blocks into a prefix pool and a PI pool.
         kv_transfer_config = self.vllm_config.kv_transfer_config
+        # Requests whose num_computed_tokens jumped past spliced PI blocks and
+        # that the model runner has not been told about yet.
+        self._ckv_resync_req_ids: set[str] = set()
         pi_pool_ratio = float(
             kv_transfer_config.get_from_extra_config(
                 "ckv_pi_pool_ratio", os.environ.get("CKV_PI_POOL_RATIO", 0.0)
@@ -1525,6 +1528,9 @@ class Scheduler(SchedulerInterface):
             spliced.extend(blocks)
         if not spliced:
             return None
+        # The model runner must reload num_computed_tokens for this request
+        # (MRV2 keeps its own device-side copy); see CachedRequestData.
+        self._ckv_resync_req_ids.add(request.request_id)
         return self.kv_cache_manager.create_kv_cache_blocks((spliced,))
 
     def _ckv_cap_prefill(
@@ -1561,6 +1567,7 @@ class Scheduler(SchedulerInterface):
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
         resumed_req_ids = set()
+        resync_req_ids: set[str] = set()
 
         num_running_reqs = len(running_reqs)
         for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
@@ -1594,6 +1601,9 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            if req_id in self._ckv_resync_req_ids:
+                self._ckv_resync_req_ids.discard(req_id)
+                resync_req_ids.add(req_id)
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1603,6 +1613,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            resync_num_computed_tokens=resync_req_ids,
         )
 
     def _try_schedule_encoder_inputs(
@@ -2468,6 +2479,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self._ckv_resync_req_ids.discard(request.request_id)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing
