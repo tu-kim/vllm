@@ -1539,7 +1539,7 @@ class Scheduler(SchedulerInterface):
         if computed >= request.num_prompt_tokens:
             return num_new_tokens  # decoding: never capped
         limit = self.connector.get_prefill_limit_at(request, computed)
-        if limit is None:
+        if not isinstance(limit, int):  # None, or a Mock in vLLM's own tests
             return num_new_tokens
         capped = limit - computed
         if 0 < capped < num_new_tokens:
