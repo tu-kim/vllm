@@ -212,15 +212,18 @@ def test_pi_pool_changes_are_published_as_chunk_events(scheduler):
     events = [e for b in pub.batches for e in b.events]
     assert events == [ChunkStored("c", 0, PI_END - PI_START, "GPU")]
 
+    def step():  # events are published when the scheduler processes a step's output
+        scheduler.update_from_output(scheduler.schedule(), step_output([], finished=False))
+
     pub.batches.clear()
     assert pi.allocate(PiKey("big", 0), pi.num_blocks * BLOCK) is not None  # evicts "c"
-    scheduler.schedule()
+    step()
     events = [e for b in pub.batches for e in b.events]
     assert events == [ChunkRemoved("c", 0, "GPU"), ChunkStored("big", 0, pi.num_blocks * BLOCK, "GPU")]
 
     pub.batches.clear()
     assert pi.reset()
-    scheduler.schedule()
+    step()
     events = [e for b in pub.batches for e in b.events]
     assert events == [ChunksCleared("GPU")]
 
