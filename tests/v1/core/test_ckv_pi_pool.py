@@ -8,10 +8,17 @@ import pytest
 
 from vllm.utils.hashing import sha256
 from vllm.v1.core.ckv_pi_pool import PiKey, PiPool
+from vllm.v1.core.kv_cache_utils import init_none_hash
 
 from .test_prefix_caching import make_kv_cache_config, make_kv_cache_manager, make_request
 
 BLOCK = 16
+
+
+@pytest.fixture(autouse=True)
+def _none_hash():
+    # Request block hashing chains from NONE_HASH, which vLLM's tests seed per hash fn.
+    init_none_hash(sha256)
 
 
 def manager(num_blocks: int, num_pi_blocks: int):
