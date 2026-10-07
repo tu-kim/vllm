@@ -3,6 +3,7 @@
 
 import functools
 import gc
+import os
 import itertools
 import threading
 import time
@@ -254,6 +255,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+_CKV_DEBUG_STEPS = os.environ.get("CKV_DEBUG_STEPS", "0") == "1"
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -2254,6 +2256,18 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        if _CKV_DEBUG_STEPS:
+            # ComposableKV diagnostics: CPU vs GPU computed-token counts per step.
+            logger.info(
+                "ckv runner step: reqs=%s cpu_computed=%s gpu_computed=%s scheduled=%s "
+                "positions[:4]=%s cpu_positions_src=%s",
+                list(self.input_batch.req_ids[:num_reqs]),
+                self.input_batch.num_computed_tokens_cpu[:num_reqs].tolist(),
+                self.num_computed_tokens[:num_reqs].tolist(),
+                num_scheduled_tokens.tolist(),
+                self.positions[:4].tolist(),
+                int(self.input_batch.num_computed_tokens_cpu_tensor[0].item()),
+            )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
