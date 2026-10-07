@@ -137,6 +137,9 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    # ComposableKV: block owned by the PI pool (shared across requests, may
+    # carry a prefix-cache hash per request that used it).
+    is_shared: bool = False
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -277,7 +278,9 @@ class Scheduler(SchedulerInterface):
         # ComposableKV: split the GPU blocks into a prefix pool and a PI pool.
         kv_transfer_config = self.vllm_config.kv_transfer_config
         pi_pool_ratio = float(
-            kv_transfer_config.get_from_extra_config("ckv_pi_pool_ratio", 0.0)
+            kv_transfer_config.get_from_extra_config(
+                "ckv_pi_pool_ratio", os.environ.get("CKV_PI_POOL_RATIO", 0.0)
+            )
             if kv_transfer_config is not None
             else 0.0
         )
@@ -308,6 +311,8 @@ class Scheduler(SchedulerInterface):
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
+            if self.kv_cache_manager.pi_pool is not None:
+                self.connector.bind_pi_pool(self.kv_cache_manager.pi_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
@@ -569,6 +574,10 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # ComposableKV: splice in shared (PI) blocks at the computed boundary
+            # and cap this chunk at the next spliced segment.
+            spliced_blocks = self._ckv_splice_shared_blocks(request)
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -579,6 +588,7 @@ class Scheduler(SchedulerInterface):
             num_new_tokens = min(
                 num_new_tokens, token_budget, input_budget - draft_slots
             )
+            num_new_tokens = self._ckv_cap_prefill(request, num_new_tokens)
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -650,6 +660,8 @@ class Scheduler(SchedulerInterface):
 
                     if new_blocks is not None:
                         # The request can be scheduled.
+                        if spliced_blocks:
+                            new_blocks = spliced_blocks + new_blocks
                         break
 
                     # The request cannot be scheduled.
@@ -979,6 +991,9 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, request_token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._ckv_cap_prefill(
+                        request, num_new_tokens, num_computed_tokens
+                    )
 
                     # Apply Mamba alignment before encoder caps.
                     if self.need_mamba_block_aligned_split:
@@ -1482,6 +1497,54 @@ class Scheduler(SchedulerInterface):
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    # ==============================
+    # ComposableKV composition hooks
+    # ==============================
+
+    def _ckv_splice_shared_blocks(self, request: Request) -> KVCacheBlocks | None:
+        """If the connector holds the KV for the tokens at the request's computed
+        boundary in shared blocks, append them to the request and skip the
+        tokens. Repeats while consecutive segments are available."""
+        if self.connector is None or self.kv_cache_manager.pi_pool is None:
+            return None
+        if request.num_computed_tokens >= request.num_prompt_tokens:
+            return None
+        spliced: list[KVCacheBlock] = []
+        while request.num_computed_tokens < request.num_prompt_tokens - 1:
+            shared = self.connector.get_shared_blocks(request)
+            if shared is None:
+                break
+            blocks, num_tokens = shared
+            assert num_tokens > 0 and num_tokens % self.block_size == 0, (
+                f"shared segment must be block-aligned: {num_tokens}"
+            )
+            assert request.num_computed_tokens + num_tokens <= request.num_prompt_tokens
+            self.kv_cache_manager.append_shared_blocks(request, blocks, num_tokens)
+            request.num_computed_tokens += num_tokens
+            spliced.extend(blocks)
+        if not spliced:
+            return None
+        return self.kv_cache_manager.create_kv_cache_blocks((spliced,))
+
+    def _ckv_cap_prefill(
+        self, request: Request, num_new_tokens: int, num_computed_tokens: int | None = None
+    ) -> int:
+        """Cap a prefill chunk at the connector's limit (start of the next
+        spliced segment). `num_computed_tokens` overrides the request's value
+        for waiting requests, whose prefix-cache hit is not applied yet."""
+        if self.connector is None or num_new_tokens <= 0:
+            return num_new_tokens
+        computed = request.num_computed_tokens if num_computed_tokens is None else num_computed_tokens
+        if computed >= request.num_prompt_tokens:
+            return num_new_tokens  # decoding: never capped
+        limit = self.connector.get_prefill_limit_at(request, computed)
+        if limit is None:
+            return num_new_tokens
+        capped = limit - computed
+        if 0 < capped < num_new_tokens:
+            return capped
+        return num_new_tokens
 
     def _make_cached_request_data(
         self,

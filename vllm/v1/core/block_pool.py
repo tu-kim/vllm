@@ -281,7 +281,11 @@ class BlockPool:
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id
             )
-            if blk.block_hash is not None:
+            if blk.block_hash is not None and blk.is_shared:
+                # ComposableKV: a PI block used by several requests keeps one
+                # prefix-cache hash per distinct prefix (secondary hashes).
+                pass
+            elif blk.block_hash is not None:
                 # The only valid case where a "new full block" already has a
                 # hash is partial->full promotion of the same cache block.
                 assert (

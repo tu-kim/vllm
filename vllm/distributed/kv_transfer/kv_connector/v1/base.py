@@ -461,6 +461,30 @@ class KVConnectorBase_V1(ABC):
     # Scheduler-side methods
     # ==============================
 
+    # ==============================
+    # ComposableKV composition hooks (scheduler side, all optional)
+    # ==============================
+
+    def bind_pi_pool(self, pi_pool: Any) -> None:
+        """Receive the GPU PI pool (vllm.v1.core.ckv_pi_pool.PiPool), if any."""
+        return None
+
+    def get_prefill_limit_at(self, request: "Request", num_computed_tokens: int) -> int | None:
+        """Token position this step's prefill of `request` must not go past
+        (e.g. the start of a KV segment that will be spliced in instead of
+        computed), given that `num_computed_tokens` tokens are computed.
+        None: no limit."""
+        return None
+
+    def get_shared_blocks(self, request: "Request") -> tuple[list[Any], int] | None:
+        """Called before scheduling a request whose prompt is not fully
+        computed. If KV for the tokens starting at request.num_computed_tokens
+        is available in shared (PI pool) blocks, return (blocks, num_tokens):
+        the scheduler splices them into the request's block table and skips
+        those tokens. Both must be block-aligned. Any load into the blocks
+        must complete in this step's start_load_kv()."""
+        return None
+
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """
         Bind the GPU block pool to the connector for per-GPU block status tracking.

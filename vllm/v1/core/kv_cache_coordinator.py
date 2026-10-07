@@ -117,6 +117,8 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
+        if self.pi_pool is not None:
+            self.pi_pool.evict_callback = self._on_pi_entry_evicted
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
@@ -171,6 +173,18 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+
+    def _on_pi_entry_evicted(self, blocks: list[KVCacheBlock]) -> None:
+        """ComposableKV: drop prefix-cache hashes that point at evicted PI blocks."""
+        for block in blocks:
+            self.block_pool._maybe_evict_cached_block(block)
+
+    def append_shared_blocks(self, request_id: str, blocks: list[KVCacheBlock]) -> None:
+        """ComposableKV: append PI blocks to the request (single KV cache group)
+        and take the request's reference on them."""
+        assert len(self.single_type_managers) == 1, "PI pool needs a single KV cache group"
+        self.block_pool.touch(blocks)
+        self.single_type_managers[0].req_to_blocks[request_id].extend(blocks)
 
     def get_num_blocks_to_allocate(
         self,

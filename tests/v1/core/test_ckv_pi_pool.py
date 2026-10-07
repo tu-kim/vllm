@@ -38,11 +38,22 @@ def test_t2_1_split_by_ratio():
     assert m.pi_usage == 0.0 and m.usage == 0.0
 
 
+def use(pool: PiPool, key: PiKey, m=None):
+    """A request takes its reference on an entry's blocks (what BlockPool.touch does)."""
+    for b in pool.entries[key].blocks:
+        b.ref_cnt += 1
+
+
+def unuse(pool: PiPool, key: PiKey):
+    """A request drops its reference (what BlockPool.free_blocks does)."""
+    for b in pool.entries[key].blocks:
+        b.ref_cnt -= 1
+
+
 def test_t2_2_prefix_pool_exhaustion_leaves_pi_pool_alone():
     m = manager(100, 20)
     pi = m.pi_pool
-    e = pi.allocate(PiKey("c1", 0), 5 * BLOCK)
-    pi.release(e.key)  # unreferenced: would be evictable *within* the PI pool
+    pi.allocate(PiKey("c1", 0), 5 * BLOCK)  # unreferenced: evictable *within* the PI pool
     before = {k: [b.block_id for b in v.blocks] for k, v in pi.entries.items()}
     # Fill the prefix pool completely (79 usable blocks; block 0 is the null block).
     blocks = m.block_pool.get_new_blocks(m.block_pool.get_num_free_blocks())
@@ -57,11 +68,10 @@ def test_t2_2_prefix_pool_exhaustion_leaves_pi_pool_alone():
 def test_t2_3_pi_pool_evicts_lru_whole_entries_only():
     m = manager(100, 12)  # PI pool: 12 blocks
     pi = m.pi_pool
-    for name, tokens in (("a", 4 * BLOCK), ("b", 4 * BLOCK), ("c", 4 * BLOCK)):
-        e = pi.allocate(PiKey(name, 0), tokens)
-        pi.release(e.key)
+    for name in ("a", "b", "c"):
+        pi.allocate(PiKey(name, 0), 4 * BLOCK)
     assert pi.get_num_free_blocks() == 0
-    pi.acquire(PiKey("a", 0)); pi.release(PiKey("a", 0))  # "a" is now most recently used
+    pi.touch(PiKey("a", 0))  # "a" is now most recently used
     prefix_free = m.block_pool.get_num_free_blocks()
     e = pi.allocate(PiKey("d", 0), 2 * BLOCK)  # needs 2 blocks -> evicts one whole entry: LRU is "b"
     assert e is not None
@@ -75,11 +85,13 @@ def test_t2_3_pi_pool_evicts_lru_whole_entries_only():
 def test_t2_4_referenced_entries_are_never_evicted():
     m = manager(100, 8)
     pi = m.pi_pool
-    a = pi.allocate(PiKey("a", 0), 4 * BLOCK)  # ref 1 (allocate references)
+    a = pi.allocate(PiKey("a", 0), 4 * BLOCK)
     b = pi.allocate(PiKey("b", 0), 4 * BLOCK)
+    use(pi, a.key)
+    use(pi, b.key)
     assert pi.allocate(PiKey("c", 0), 1 * BLOCK) is None  # everything referenced
     assert set(pi.entries) == {a.key, b.key} and pi.get_num_free_blocks() == 0
-    pi.release(b.key)
+    unuse(pi, b.key)
     assert pi.allocate(PiKey("c", 0), 1 * BLOCK) is not None  # now "b" can go
     assert b.key not in pi.entries and a.key in pi.entries
 
@@ -93,19 +105,22 @@ def test_t2_5_same_chunk_different_offsets_are_separate_entries():
     assert pi.allocate(PiKey("c", 1024), 3 * BLOCK) is None  # duplicate key
 
 
-def test_t2_6_shared_entry_refcount():
-    pi = PiPool(first_block_id=0, num_blocks=10, block_size=BLOCK)
+def test_t2_6_shared_entry_refcount_rides_on_blocks():
+    """Two requests use one entry through ordinary block refs; the entry's own
+    reference keeps the blocks out of the prefix pool's free path."""
+    m = manager(100, 10)
+    pi, bp = m.pi_pool, m.block_pool
     e = pi.allocate(PiKey("c", 0), 2 * BLOCK)
-    assert e.ref_cnt == 1
-    pi.release(e.key)
-    r1 = pi.acquire(PiKey("c", 0))
-    r2 = pi.acquire(PiKey("c", 0))
-    assert r1 is r2 and e.ref_cnt == 2 and all(b.ref_cnt == 1 for b in e.blocks)
-    pi.release(e.key)
+    assert e.ref_cnt == 0 and all(b.ref_cnt == 1 for b in e.blocks)
+    bp.touch(e.blocks)  # request 1
+    bp.touch(e.blocks)  # request 2
+    assert e.ref_cnt == 2
+    bp.free_blocks(reversed(e.blocks))  # request 1 done: the usual free path
     assert e.ref_cnt == 1 and not pi.remove(e.key)  # still referenced
-    pi.release(e.key)
+    assert bp.get_num_free_blocks() == 89  # PI blocks never enter the prefix free queue
+    bp.free_blocks(reversed(e.blocks))
     assert e.ref_cnt == 0 and pi.remove(e.key) and pi.get_num_free_blocks() == 10
-    assert pi.acquire(PiKey("c", 0)) is None
+    assert bp.get_num_free_blocks() == 89
 
 
 def test_t2_8_ratio_zero_keeps_vllm_behavior():
@@ -139,8 +154,31 @@ def test_allocation_bigger_than_pool_is_rejected():
 def test_reset_drops_unreferenced_only():
     pi = PiPool(first_block_id=0, num_blocks=8, block_size=BLOCK)
     a = pi.allocate(PiKey("a", 0), BLOCK)
-    b = pi.allocate(PiKey("b", 0), BLOCK)
-    pi.release(b.key)
+    pi.allocate(PiKey("b", 0), BLOCK)
+    use(pi, a.key)
     assert not pi.reset() and set(pi.entries) == {a.key}
-    pi.release(a.key)
+    unuse(pi, a.key)
     assert pi.reset() and not pi.entries and pi.get_num_free_blocks() == 8
+
+
+def test_pi_blocks_in_prefix_cache_follow_the_entry():
+    """V-COMP-6: a PI block cached under a request's chain hash is hit by a later
+    request with the same prefix, keeps one hash per distinct prefix, and loses
+    them all when the entry is evicted."""
+    from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
+
+    m = manager(100, 10)
+    pi, bp = m.pi_pool, m.block_pool
+    e = pi.allocate(PiKey("c", 0), BLOCK)
+    blk = e.blocks[0]
+    h1 = make_block_hash_with_group_id(BlockHash(b"prefix-1"), 0)
+    h2 = make_block_hash_with_group_id(BlockHash(b"prefix-2"), 0)
+    bp._insert_block_hash(h1, blk, num_tokens=BLOCK)
+    bp._insert_block_hash(h2, blk, num_tokens=BLOCK)
+    assert bp.cached_block_hash_to_block.get_one_block(h1) is blk
+    assert bp.cached_block_hash_to_block.get_one_block(h2) is blk
+    pi.allocate(PiKey("big", 0), 9 * BLOCK)  # needs the whole pool: evicts "c"
+    assert PiKey("c", 0) not in pi.entries
+    assert bp.cached_block_hash_to_block.get_one_block(h1) is None
+    assert bp.cached_block_hash_to_block.get_one_block(h2) is None
+    assert blk.block_hash is None

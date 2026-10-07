@@ -7,12 +7,23 @@ Entries are whole chunks keyed by (chunk_hash, offset): the chunk's KV as
 rotated for absolute position `offset`, so the same chunk at two offsets is two
 entries. Eviction is per entry (LRU among entries no request references) and
 never touches the prefix pool, and vice versa.
+
+Reference counting rides on KVCacheBlock.ref_cnt like every other block: the
+entry itself holds one reference on each of its blocks, and requests add theirs
+through BlockPool.touch / free_blocks (a PI block never reaches ref_cnt 0 while
+its entry exists, so the prefix pool never recycles it). An entry is evictable
+when every block is back to ref_cnt == 1.
+
+PI blocks may also be registered in the prefix-cache hash map (under the chain
+hash of a request that used them) so a later request with the same prefix hits
+them like any cached block; evicting the entry removes those hashes through
+`evict_callback`.
 """
 
 from __future__ import annotations
 
 import time
-from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -29,10 +40,14 @@ class PiEntry:
     key: PiKey
     num_tokens: int
     blocks: list[KVCacheBlock]
-    ref_cnt: int = 0
     last_used: float = field(default_factory=time.monotonic)
-    # Set by the worker side once the KV has actually been copied into the blocks.
+    # Set once the worker has copied the KV into the blocks.
     loaded: bool = False
+
+    @property
+    def ref_cnt(self) -> int:
+        """Number of requests referencing the entry (block refs minus the entry's own)."""
+        return max(b.ref_cnt for b in self.blocks) - 1
 
 
 @dataclass
@@ -48,16 +63,20 @@ class PiPool:
         self.first_block_id = first_block_id
         self.num_blocks = num_blocks
         self.block_size = block_size
-        self.blocks = [KVCacheBlock(first_block_id + i) for i in range(num_blocks)]
+        self.blocks = [KVCacheBlock(first_block_id + i, is_shared=True) for i in range(num_blocks)]
         self.free_queue = FreeKVCacheBlockQueue(self.blocks)
         self.entries: dict[PiKey, PiEntry] = {}
-        # Unreferenced entries in LRU order (oldest first): eviction candidates.
-        self._lru: OrderedDict[PiKey, None] = OrderedDict()
         self.events: list[PiEvent] = []
+        # Called with an entry's blocks right before they are freed, so the
+        # owner can drop prefix-cache hashes that point at them.
+        self.evict_callback: Callable[[list[KVCacheBlock]], None] | None = None
 
     # ---- queries
     def lookup(self, key: PiKey) -> PiEntry | None:
         return self.entries.get(key)
+
+    def is_pi_block(self, block: KVCacheBlock) -> bool:
+        return block.is_shared and self.first_block_id <= block.block_id < self.first_block_id + self.num_blocks
 
     def get_num_free_blocks(self) -> int:
         return self.free_queue.num_free_blocks
@@ -68,62 +87,57 @@ class PiPool:
     def num_blocks_for(self, num_tokens: int) -> int:
         return (num_tokens + self.block_size - 1) // self.block_size
 
+    def evictable(self) -> list[PiEntry]:
+        """Unreferenced entries, least recently used first."""
+        return sorted((e for e in self.entries.values() if e.ref_cnt == 0), key=lambda e: e.last_used)
+
     # ---- lifecycle
     def allocate(self, key: PiKey, num_tokens: int) -> PiEntry | None:
-        """Reserve blocks for a new entry and reference it once. Evicts
-        unreferenced entries, least recently used first, until the blocks fit.
-        Returns None (and evicts nothing) if the referenced entries alone leave
-        too little room, or if the key already exists."""
+        """Reserve blocks for a new entry. Evicts unreferenced entries, least
+        recently used first, until the blocks fit. Returns None (and evicts
+        nothing) if the referenced entries alone leave too little room, or if
+        the key already exists. The blocks carry only the entry's own reference;
+        the caller adds the request's via BlockPool.touch."""
         if key in self.entries:
             return None
         need = self.num_blocks_for(num_tokens)
         if need > self.num_blocks:
             return None
-        evictable = sum(len(self.entries[k].blocks) for k in self._lru)
-        if need > self.get_num_free_blocks() + evictable:
+        victims = self.evictable()
+        if need > self.get_num_free_blocks() + sum(len(v.blocks) for v in victims):
             return None
-        while need > self.get_num_free_blocks():
-            victim, _ = self._lru.popitem(last=False)
-            self._remove(victim)
+        for victim in victims:
+            if need <= self.get_num_free_blocks():
+                break
+            self._remove(victim.key)
         blocks = self.free_queue.popleft_n(need)
         for b in blocks:
             assert b.ref_cnt == 0
             b.ref_cnt = 1
-        entry = PiEntry(key, num_tokens, blocks, ref_cnt=1)
+        entry = PiEntry(key, num_tokens, blocks)
         self.entries[key] = entry
         self.events.append(PiEvent("stored", key, num_tokens))
         return entry
 
-    def acquire(self, key: PiKey) -> PiEntry | None:
-        """Reference an existing entry (a request is about to use its blocks)."""
+    def touch(self, key: PiKey) -> PiEntry | None:
+        """Mark an entry as used now (LRU bookkeeping only)."""
         entry = self.entries.get(key)
-        if entry is None:
-            return None
-        if entry.ref_cnt == 0:
-            self._lru.pop(key, None)
-        entry.ref_cnt += 1
-        entry.last_used = time.monotonic()
-        return entry
-
-    def release(self, key: PiKey) -> None:
-        entry = self.entries[key]
-        assert entry.ref_cnt > 0, f"release of unreferenced PI entry {key}"
-        entry.ref_cnt -= 1
-        if entry.ref_cnt == 0:
+        if entry is not None:
             entry.last_used = time.monotonic()
-            self._lru[key] = None  # newest at the end
+        return entry
 
     def remove(self, key: PiKey) -> bool:
         """Drop an unreferenced entry explicitly (e.g. its chunk went stale)."""
         entry = self.entries.get(key)
         if entry is None or entry.ref_cnt > 0:
             return False
-        self._lru.pop(key, None)
         self._remove(key)
         return True
 
     def _remove(self, key: PiKey) -> None:
         entry = self.entries.pop(key)
+        if self.evict_callback is not None:
+            self.evict_callback(entry.blocks)
         for b in entry.blocks:
             b.ref_cnt = 0
         self.free_queue.append_n(entry.blocks)
@@ -131,9 +145,8 @@ class PiPool:
 
     def reset(self) -> bool:
         """Drop every unreferenced entry. False if some entry is still in use."""
-        for key in list(self._lru):
-            self._lru.pop(key)
-            self._remove(key)
+        for entry in self.evictable():
+            self._remove(entry.key)
         return not self.entries
 
     def take_events(self) -> list[PiEvent]:

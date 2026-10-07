@@ -194,6 +194,13 @@ class KVCacheManager:
         # offload; pinned until the request's blocks are freed.
         self._partial_tail_pins: dict[str, list[KVCacheBlock]] = {}
 
+    def append_shared_blocks(self, request: Request, blocks: list[KVCacheBlock], num_tokens: int) -> None:
+        """ComposableKV: splice PI-pool blocks covering `num_tokens` tokens at the
+        request's current computed-token boundary. Both must be block-aligned."""
+        assert request.num_computed_tokens % self.block_pool.hash_block_size == 0
+        assert len(blocks) * self.block_pool.hash_block_size >= num_tokens
+        self.coordinator.append_shared_blocks(request.request_id, blocks)
+
     @property
     def pi_usage(self) -> float:
         """ComposableKV: PI pool usage (0.0 when there is no PI pool)."""
@@ -642,6 +649,9 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        # ComposableKV: PI entries first (drops their prefix-cache hashes).
+        if self.pi_pool is not None and not self.pi_pool.reset():
+            return False
         if not self.block_pool.reset_prefix_cache():
             return False
         if self.log_stats:
