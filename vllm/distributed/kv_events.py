@@ -116,8 +116,30 @@ class AllBlocksCleared(KVCacheEvent):
     pass
 
 
+# ComposableKV (V-OBS-1): position-independent KV chunks held by the worker.
+# `offset` is the absolute prompt position the chunk's KV was rotated to
+# (0 for the DRAM original); `medium` is "GPU" (PI pool) or "DRAM" (node store).
+class ChunkStored(KVCacheEvent):
+    chunk_hash: str
+    offset: int
+    num_tokens: int
+    medium: str
+
+
+class ChunkRemoved(KVCacheEvent):
+    chunk_hash: str
+    offset: int
+    medium: str
+
+
+class ChunksCleared(KVCacheEvent):
+    medium: str
+
+
 class KVEventBatch(EventBatch):
-    events: list[BlockStored | BlockRemoved | AllBlocksCleared]
+    events: list[
+        BlockStored | BlockRemoved | AllBlocksCleared | ChunkStored | ChunkRemoved | ChunksCleared
+    ]
 
 
 class KVEventAggregator:

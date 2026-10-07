@@ -180,6 +180,44 @@ def test_evicting_the_entry_drops_prefix_hashes(scheduler):
     assert n_hit == PI_START  # hit stops where the PI blocks were
 
 
+class RecordingPublisher:
+    def __init__(self):
+        self.batches = []
+
+    def publish(self, batch):
+        self.batches.append(batch)
+
+    def shutdown(self):
+        pass
+
+
+def test_pi_pool_changes_are_published_as_chunk_events(scheduler):
+    """T5-1: splice -> ChunkStored(GPU); eviction -> ChunkRemoved; reset -> ChunksCleared."""
+    from vllm.distributed.kv_events import ChunkRemoved, ChunksCleared, ChunkStored
+
+    pub = RecordingPublisher()
+    scheduler.kv_event_publisher = pub
+    pi = scheduler.kv_cache_manager.pi_pool
+    req = create_requests(1, num_tokens=PROMPT, block_size=BLOCK, max_tokens=1)[0]
+    scheduler.connector.plan_reqs.add(req.request_id)
+    scheduler.add_request(req)
+    run_prefill(scheduler, req)
+    events = [e for b in pub.batches for e in b.events]
+    assert events == [ChunkStored("c", 0, PI_END - PI_START, "GPU")]
+
+    pub.batches.clear()
+    assert pi.allocate(PiKey("big", 0), pi.num_blocks * BLOCK) is not None  # evicts "c"
+    scheduler.schedule()
+    events = [e for b in pub.batches for e in b.events]
+    assert events == [ChunkRemoved("c", 0, "GPU"), ChunkStored("big", 0, pi.num_blocks * BLOCK, "GPU")]
+
+    pub.batches.clear()
+    assert pi.reset()
+    scheduler.schedule()
+    events = [e for b in pub.batches for e in b.events]
+    assert events == [ChunksCleared("GPU")]
+
+
 def test_requests_without_plan_are_untouched(scheduler):
     req = create_requests(1, num_tokens=PROMPT, block_size=BLOCK, max_tokens=1)[0]
     scheduler.add_request(req)

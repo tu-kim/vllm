@@ -52,8 +52,8 @@ class PiEntry:
 
 @dataclass
 class PiEvent:
-    kind: str  # "stored" | "removed"
-    key: PiKey
+    kind: str  # "stored" | "removed" | "cleared"
+    key: PiKey | None
     num_tokens: int = 0
 
 
@@ -147,6 +147,10 @@ class PiPool:
         """Drop every unreferenced entry. False if some entry is still in use."""
         for entry in self.evictable():
             self._remove(entry.key)
+        if not self.entries:
+            # One event instead of a removal per entry (V-OBS-1 ChunksCleared).
+            self.events = [e for e in self.events if e.kind != "removed"]
+            self.events.append(PiEvent("cleared", None))
         return not self.entries
 
     def take_events(self) -> list[PiEvent]:
