@@ -177,7 +177,7 @@ def test_pi_blocks_in_prefix_cache_follow_the_entry():
     bp._insert_block_hash(h2, blk, num_tokens=BLOCK)
     assert bp.cached_block_hash_to_block.get_one_block(h1) is blk
     assert bp.cached_block_hash_to_block.get_one_block(h2) is blk
-    pi.allocate(PiKey("big", 0), 9 * BLOCK)  # needs the whole pool: evicts "c"
+    assert pi.allocate(PiKey("big", 0), 10 * BLOCK) is not None  # needs the whole pool: evicts "c"
     assert PiKey("c", 0) not in pi.entries
     assert bp.cached_block_hash_to_block.get_one_block(h1) is None
     assert bp.cached_block_hash_to_block.get_one_block(h2) is None
