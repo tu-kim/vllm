@@ -33,6 +33,13 @@ class FakeComposer:
     def bind_pi_pool(self, pi_pool):
         self.pi_pool = pi_pool
 
+    def take_events(self):
+        # What CkvConnector.take_events does for the GPU pool (the wrapped
+        # ExampleConnector has no PI pool); the DRAM part needs a store.
+        from ckv.vllm_connector import chunk_events_from_pool
+
+        return chunk_events_from_pool(self.pi_pool)
+
     def get_prefill_limit_at(self, request, num_computed_tokens):
         if request.request_id not in self.plan_reqs:
             return None
