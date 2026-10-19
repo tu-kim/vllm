@@ -476,14 +476,25 @@ class KVConnectorBase_V1(ABC):
         None: no limit."""
         return None
 
-    def get_shared_blocks(self, request: "Request") -> tuple[list[Any], int] | None:
+    def get_shared_blocks(
+        self, request: "Request", pos: int | None = None
+    ) -> tuple[list[Any], int] | None:
         """Called before scheduling a request whose prompt is not fully
-        computed. If KV for the tokens starting at request.num_computed_tokens
-        is available in shared (PI pool) blocks, return (blocks, num_tokens):
-        the scheduler splices them into the request's block table and skips
-        those tokens. Both must be block-aligned. Any load into the blocks
-        must complete in this step's start_load_kv()."""
+        computed. If KV for the tokens starting at `pos` (None: at
+        request.num_computed_tokens) is available in shared (PI pool) blocks,
+        return (blocks, num_tokens): the scheduler splices them into the
+        request's block table and skips those tokens. Both must be
+        block-aligned. Any load into the blocks must complete in this step's
+        start_load_kv(). With the one-step layout (V-COMP-8) the scheduler
+        walks the plan ahead of request.num_computed_tokens, so `pos` must be
+        used wherever request.num_computed_tokens was used before."""
         return None
+
+    def ckv_one_step(self, request: "Request") -> bool:
+        """True: the scheduler may fold this request's remaining recompute
+        segments into one forward (pseudo-request rows, V-COMP-8). The
+        scheduler acts only on the exact value True."""
+        return False
 
     def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
         """

@@ -47,8 +47,10 @@ class FakeComposer:
             return PI_START
         return None
 
-    def get_shared_blocks(self, request):
-        if request.request_id not in self.plan_reqs or request.num_computed_tokens != PI_START:
+    def get_shared_blocks(self, request, pos=None):
+        if pos is None:
+            pos = request.num_computed_tokens
+        if request.request_id not in self.plan_reqs or pos != PI_START:
             return None
         key = PiKey("c", 0)
         entry = self.pi_pool.lookup(key) or self.pi_pool.allocate(key, PI_END - PI_START)
