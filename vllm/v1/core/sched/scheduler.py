@@ -280,6 +280,7 @@ class Scheduler(SchedulerInterface):
         # Requests whose num_computed_tokens jumped past spliced PI blocks and
         # that the model runner has not been told about yet.
         self._ckv_resync_req_ids: set[str] = set()
+        self._ckv_last_scheduled_tokens: dict[str, int] | None = None
         pi_pool_ratio = float(
             kv_transfer_config.get_from_extra_config(
                 "ckv_pi_pool_ratio", os.environ.get("CKV_PI_POOL_RATIO", 0.0)
@@ -1323,6 +1324,9 @@ class Scheduler(SchedulerInterface):
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
+        if self.log_stats:
+            self._ckv_last_scheduled_tokens = dict(num_scheduled_tokens)
+
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
@@ -2694,6 +2698,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats.data if kv_connector_stats else None
         )
         return SchedulerStats(
+            scheduled_tokens=self._ckv_last_scheduled_tokens,
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             num_skipped_waiting_reqs=len(self.skipped_waiting),

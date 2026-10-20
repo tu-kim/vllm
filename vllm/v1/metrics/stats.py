@@ -206,6 +206,11 @@ class SchedulerStats:
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
+    # ComposableKV: tokens scheduled per request in the step this stats object
+    # describes (log_stats only). Lets a stat logger split a request's prefill
+    # time into its own compute share and contention with other requests.
+    scheduled_tokens: dict[str, int] | None = None
+
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
     running_lora_adapters: dict[str, int] = field(default_factory=dict)
 
