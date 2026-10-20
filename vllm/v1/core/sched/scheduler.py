@@ -892,6 +892,24 @@ class Scheduler(SchedulerInterface):
                         else:
                             num_external_computed_tokens = ext_tokens
 
+                        if (
+                            num_external_computed_tokens == 0
+                            and not load_kv_async
+                            and not hit_diverged
+                        ):
+                            # ComposableKV: a shorter local hit when a PI segment
+                            # starts at the hit boundary (see _ckv_local_prefix).
+                            adj = self._ckv_local_prefix(
+                                request, num_new_local_computed_tokens
+                            )
+                            if adj is not None:
+                                new_computed_blocks = (
+                                    self.kv_cache_manager.truncate_computed_blocks(
+                                        new_computed_blocks, adj
+                                    )
+                                )
+                                num_new_local_computed_tokens = adj
+
                         if hit_diverged and num_external_computed_tokens == 0:
                             # No external tokens back the deeper local hit, so its
                             # resume boundary would have no valid Mamba state.
@@ -1536,6 +1554,20 @@ class Scheduler(SchedulerInterface):
         # (MRV2 keeps its own device-side copy); see CachedRequestData.
         self._ckv_resync_req_ids.add(request.request_id)
         return self.kv_cache_manager.create_kv_cache_blocks((spliced,))
+
+    def _ckv_local_prefix(self, request: Request, local_hit: int) -> int | None:
+        """A block-aligned local hit shorter than `local_hit` that the connector
+        asks for, so a PI segment at the hit boundary is spliced by the running
+        pass of the next step instead of being prefilled through."""
+        if self.connector is None or local_hit < self.block_size:
+            return None
+        hook = getattr(self.connector, "ckv_local_prefix", None)
+        if hook is None:
+            return None
+        adj = hook(request)
+        if not isinstance(adj, int) or adj % self.block_size or not 0 <= adj < local_hit:
+            return None
+        return adj
 
     def _ckv_cap_prefill(
         self, request: Request, num_new_tokens: int, num_computed_tokens: int | None = None
