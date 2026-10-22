@@ -67,6 +67,15 @@ class FakeComposer:
     def ckv_one_step(self, request):
         return self.one_step
 
+    # Requests whose local prefix hit ends exactly at a PI start: CkvConnector
+    # backs the hit off one block (ckv_local_prefix) so the PI is spliced next step.
+    backoff_reqs: set[str] = set()
+
+    def ckv_local_prefix(self, request):
+        if request.request_id in self.backoff_reqs:
+            return C_START - BLOCK
+        return None
+
     def get_prefill_limit_at(self, request, num_computed_tokens):
         plan = self.plans.get(request.request_id)
         if plan is None:
@@ -569,3 +578,34 @@ def test_prompt_embeds_keep_the_sequential_path(make_scheduler, with_ids):
     assert [o.num_scheduled_tokens for o in outs] == [{rid: 48}, {rid: 16}, {rid: 20}]
     assert [len(o.scheduled_new_reqs) for o in outs] == [1, 0, 0]
     assert scheduler.connector.spliced == [(rid, None), (rid, None)]
+
+
+def test_prefix_hit_at_pi_start_backs_off_then_one_step(make_scheduler):
+    """V-COMP-2 back-off + V-COMP-8: a local hit ending at the first PI start is
+    shortened by one block (step 1 recomputes it, capped at the PI start) and the
+    running pass then lays out the whole rest in one step: both PI splices and
+    the middle recompute segment as a pseudo row, the tail as the own row."""
+    scheduler = make_scheduler(one_step=True)
+    r0 = create_requests(1, num_tokens=C_START, block_size=BLOCK, max_tokens=1, same_prompt=True, req_ids=["p"])[0]
+    scheduler.add_request(r0)
+    run_prefill(scheduler, r0)  # caches blocks [0, 48)
+    req = create_requests(1, num_tokens=PROMPT, block_size=BLOCK, max_tokens=1, same_prompt=True, req_ids=["q"])[0]
+    scheduler.connector.plans[req.request_id] = PLAN
+    scheduler.connector.backoff_reqs.add(req.request_id)
+    scheduler.add_request(req)
+
+    out1 = scheduler.schedule()
+    new = out1.scheduled_new_reqs[0]
+    assert new.num_computed_tokens == C_START - BLOCK
+    assert out1.num_scheduled_tokens == {req.request_id: BLOCK}
+    assert scheduler.connector.spliced == []
+    scheduler.update_from_output(out1, step_output([req.request_id]))
+
+    out2 = scheduler.schedule()
+    pseudo = [r for r in out2.num_scheduled_tokens if r != req.request_id]
+    assert len(pseudo) == 1 and out2.num_scheduled_tokens[pseudo[0]] == 16  # [160,176)
+    assert out2.num_scheduled_tokens[req.request_id] == 20  # [240,260)
+    assert [pos for _, pos in scheduler.connector.spliced] == [C_START, D_START]
+    assert req.num_computed_tokens == PROMPT  # scheduled tokens are counted at schedule time
+    scheduler.update_from_output(out2, step_output(list(out2.num_scheduled_tokens), {req.request_id: [7]}))
+    assert req.status == RequestStatus.FINISHED_STOPPED or req.num_computed_tokens >= PROMPT
