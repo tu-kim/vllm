@@ -26,6 +26,7 @@ class FakeComposer:
     def __init__(self, inner, pi_pool, plan_reqs: set[str]):
         self.inner, self.pi_pool, self.plan_reqs = inner, pi_pool, plan_reqs
         self.spliced: list[str] = []
+        self.backoff_reqs: set[str] = set()
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -45,6 +46,13 @@ class FakeComposer:
             return None
         if num_computed_tokens < PI_START:
             return PI_START
+        return None
+
+    def ckv_local_prefix(self, request):
+        # A hit ending exactly at the PI start: ask for one block less (what
+        # CkvConnector._accept_plan does), so the PI is spliced next step.
+        if request.request_id in self.plan_reqs and self.backoff_reqs and request.request_id in self.backoff_reqs:
+            return PI_START - BLOCK
         return None
 
     def get_shared_blocks(self, request, pos=None):
@@ -171,6 +179,51 @@ def test_second_request_hits_the_whole_prefix_through_pi_blocks(scheduler):
     scheduler.update_from_output(out, step_output([r2], finished=True))
     assert pi.lookup(PiKey("c", 0)).ref_cnt == 0
     assert scheduler.connector.spliced == [r1.request_id]  # r2 never needed a splice
+
+
+def test_pi_at_the_prefix_hit_boundary_is_spliced_next_step(scheduler):
+    """A local prefix hit that ends exactly where a PI segment starts: without the
+    back-off the waiting pass has nothing to cap at and prefills through the PI
+    (c5-k512-2, 1 of 135 plans). With it, step 1 recomputes the last hit block
+    and step 2 splices."""
+    r0 = create_requests(1, num_tokens=PI_START, block_size=BLOCK, max_tokens=1, same_prompt=True,
+                         req_ids=["p"])[0]
+    scheduler.add_request(r0)  # no plan: computes [0, 48) and caches 3 blocks
+    run_prefill(scheduler, r0)
+    r2 = create_requests(1, num_tokens=PROMPT, block_size=BLOCK, max_tokens=1, same_prompt=True,
+                         req_ids=["q"])[0]
+    scheduler.connector.plan_reqs.add(r2.request_id)
+    scheduler.connector.backoff_reqs.add(r2.request_id)
+    scheduler.add_request(r2)
+
+    out1 = scheduler.schedule()
+    new = out1.scheduled_new_reqs[0]
+    assert new.num_computed_tokens == PI_START - BLOCK  # hit backed off by one block
+    assert out1.num_scheduled_tokens[r2.request_id] == BLOCK  # capped at the PI start
+    scheduler.update_from_output(out1, step_output([r2], finished=False))
+
+    out2 = scheduler.schedule()
+    assert scheduler.connector.spliced == [r2.request_id]
+    assert out2.num_scheduled_tokens[r2.request_id] == PROMPT - PI_END
+    scheduler.update_from_output(out2, step_output([r2], finished=True))
+    assert scheduler.kv_cache_manager.pi_pool.lookup(PiKey("c", 0)).ref_cnt == 0
+
+
+def test_pi_at_the_prefix_hit_boundary_without_backoff_is_prefilled_through(scheduler):
+    """The failure mode the back-off exists for (documents why)."""
+    r0 = create_requests(1, num_tokens=PI_START, block_size=BLOCK, max_tokens=1, same_prompt=True,
+                         req_ids=["p"])[0]
+    scheduler.add_request(r0)
+    run_prefill(scheduler, r0)
+    r2 = create_requests(1, num_tokens=PROMPT, block_size=BLOCK, max_tokens=1, same_prompt=True,
+                         req_ids=["q"])[0]
+    scheduler.connector.plan_reqs.add(r2.request_id)
+    scheduler.add_request(r2)
+    out1 = scheduler.schedule()
+    assert out1.scheduled_new_reqs[0].num_computed_tokens == PI_START
+    assert out1.num_scheduled_tokens[r2.request_id] == PROMPT - PI_START
+    scheduler.update_from_output(out1, step_output([r2], finished=True))
+    assert scheduler.connector.spliced == []
 
 
 def test_evicting_the_entry_drops_prefix_hashes(scheduler):

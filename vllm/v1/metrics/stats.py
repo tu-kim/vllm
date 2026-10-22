@@ -206,6 +206,11 @@ class SchedulerStats:
     spec_decoding_stats: SpecDecodingStats | None = None
     kv_connector_stats: dict[str, Any] | None = None
 
+    # ComposableKV: tokens scheduled per request in the step this stats object
+    # describes (log_stats only). Lets a stat logger split a request's prefill
+    # time into its own compute share and contention with other requests.
+    scheduled_tokens: dict[str, int] | None = None
+
     waiting_lora_adapters: dict[str, int] = field(default_factory=dict)
     running_lora_adapters: dict[str, int] = field(default_factory=dict)
 
@@ -253,6 +258,9 @@ class FinishedRequestStats:
     mean_time_per_output_token: float = 0.0
     is_corrupted: bool = False
     num_cached_tokens: int = 0
+    # ComposableKV: of num_cached_tokens, those served by a KV connector
+    # (e.g. host-DRAM offload) rather than the local GPU prefix cache.
+    num_external_cached_tokens: int = 0
 
 
 @dataclass
@@ -457,6 +465,7 @@ class IterationStats:
         max_tokens_param: int | None,
         req_stats: RequestStateStats,
         num_cached_tokens: int = 0,
+        num_external_cached_tokens: int = 0,
     ):
         e2e_latency = self._time_since(req_stats.arrival_time)
 
@@ -496,6 +505,7 @@ class IterationStats:
             mean_time_per_output_token=mean_time_per_output_token,
             is_corrupted=req_stats.is_corrupted,
             num_cached_tokens=num_cached_tokens,
+            num_external_cached_tokens=num_external_cached_tokens,
         )
         self.finished_requests.append(finished_req)
 
