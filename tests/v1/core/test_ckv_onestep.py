@@ -113,13 +113,17 @@ def step_output(req_ids: list[str], sampled: dict[str, list[int]] | None = None)
     )
 
 
-@pytest.fixture
-def make_scheduler(monkeypatch):
+@pytest.fixture(params=[False, True], ids=["sync", "async"])
+def make_scheduler(monkeypatch, request):
+    """Every test runs under the plain Scheduler and under AsyncScheduler (the
+    server default; Dynamo's InstrumentedScheduler derives from it)."""
     monkeypatch.setenv("CKV_PI_POOL_RATIO", "0.25")
+    async_sched = request.param
 
     def _make(one_step: bool = True, **kwargs):
         kwargs.setdefault("max_num_batched_tokens", 8192)
         kwargs.setdefault("num_blocks", 200)
+        kwargs.setdefault("async_scheduling", async_sched)
         s = create_scheduler(
             use_kv_connector=True, enable_prefix_caching=True, block_size=BLOCK, **kwargs
         )

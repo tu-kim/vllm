@@ -1706,7 +1706,6 @@ class Scheduler(SchedulerInterface):
         checks = (
             ("spec decode", self.num_spec_tokens > 0 or bool(request.spec_token_ids)),
             ("prefill lookahead", self.num_prefill_lookahead > 0),
-            ("async scheduling", bool(self.scheduler_config.async_scheduling)),
             ("pipeline parallel", self.use_pp),
             ("ubatching", self.parallel_config.use_ubatching),
             ("mamba alignment", self.need_mamba_block_aligned_split),

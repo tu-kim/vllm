@@ -24,7 +24,12 @@ class AsyncScheduler(Scheduler):
             -1
         ] * scheduler_output.num_spec_tokens_to_schedule
         for req_id in scheduler_output.num_scheduled_tokens:
-            request = self.requests[req_id]
+            request = self.requests.get(req_id)
+            if request is None:
+                # ComposableKV one-step pseudo row (V-COMP-8): lives only in
+                # this step's output and samples nothing -> no placeholder.
+                assert "-ckv" in req_id, req_id
+                continue
             if request.is_prefill_chunk:
                 continue
 
