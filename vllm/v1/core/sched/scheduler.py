@@ -285,6 +285,7 @@ class Scheduler(SchedulerInterface):
         # One-step layout (V-COMP-8): ids of the pseudo-request rows emitted
         # by the last schedule(); they go out in the next step's finished set.
         self._ckv_pseudo_req_ids: set[str] = set()
+        self._ckv_refusal_logged: set[str] = set()
         # Pseudo rows read blocks of the same forward through the parent's
         # table; only full-attention managers never null blocks by position.
         self._ckv_full_attention_only = all(
@@ -1684,30 +1685,47 @@ class Scheduler(SchedulerInterface):
         embeds, mamba alignment, overlapping batches) or a KV cache manager
         that frees blocks by position (sliding window, chunked local) keeps
         the sequential path."""
+        why = self._ckv_one_step_refusal(request)
+        if why is None:
+            return True
+        if why != "not requested" and request.request_id not in self._ckv_refusal_logged:
+            self._ckv_refusal_logged.add(request.request_id)
+            logger.info("ckv one-step refused for %s: %s", request.request_id, why)
+        return False
+
+    def _ckv_one_step_refusal(self, request: Request) -> str | None:
+        """None when the one-step layout may be used, else the reason."""
         if self.connector is None or self.kv_cache_manager.pi_pool is None:
-            return False
+            return "no connector / PI pool"
         if not self._ckv_full_attention_only:
-            return False
+            return "non-full-attention KV cache group"
         if request.num_computed_tokens >= request.num_prompt_tokens:
-            return False
+            return "not requested"  # decoding
         if request.prompt_token_ids is None or request.prompt_embeds is not None:
-            return False  # a pseudo row carries token ids only
-        if (
-            self.num_spec_tokens > 0
-            or request.spec_token_ids
-            or self.num_prefill_lookahead > 0
-            or self.scheduler_config.async_scheduling
-            or self.use_pp
-            or self.parallel_config.use_ubatching
-            or self.need_mamba_block_aligned_split
-            or request.has_encoder_inputs
-            or request.pooling_params is not None
-            or request.sampling_params is None
-            or request.sampling_params.prompt_logprobs is not None
-        ):
-            return False
+            return "prompt embeds"  # a pseudo row carries token ids only
+        checks = (
+            ("spec decode", self.num_spec_tokens > 0 or bool(request.spec_token_ids)),
+            ("prefill lookahead", self.num_prefill_lookahead > 0),
+            ("async scheduling", bool(self.scheduler_config.async_scheduling)),
+            ("pipeline parallel", self.use_pp),
+            ("ubatching", self.parallel_config.use_ubatching),
+            ("mamba alignment", self.need_mamba_block_aligned_split),
+            ("encoder inputs", request.has_encoder_inputs),
+            ("pooling", request.pooling_params is not None),
+            ("no sampling params", request.sampling_params is None),
+            (
+                "prompt logprobs",
+                request.sampling_params is not None
+                and request.sampling_params.prompt_logprobs is not None,
+            ),
+        )
+        for name, hit in checks:
+            if hit:
+                return name
         # Exactly True: a Mock connector (vLLM's own tests) is truthy.
-        return self.connector.ckv_one_step(request) is True
+        if self.connector.ckv_one_step(request) is not True:
+            return "not requested"
+        return None
 
     def _ckv_schedule_layout(
         self, request: Request, budget: int, row_budget: int
