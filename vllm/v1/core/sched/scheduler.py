@@ -10,7 +10,7 @@ from dataclasses import replace
 from typing import Any
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
-from vllm.config import KVEventsConfig, VllmConfig
+from vllm.config import CUDAGraphMode, KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorBase,
     ECConnectorMetadata,
@@ -1808,9 +1808,12 @@ class Scheduler(SchedulerInterface):
         # A sparse row carries per-token positions: one position per token.
         if self.vllm_config.model_config.uses_mrope:
             return None, "flex: M-RoPE positions"
+        # A sparse row only occurs in a prefill step (max_query_len > 1), which
+        # FULL_AND_PIECEWISE / FULL_DECODE_ONLY run piecewise; only a pure FULL
+        # mode could capture such a batch.
         mode = self.vllm_config.compilation_config.cudagraph_mode
-        if mode is not None and mode.has_full_cudagraphs():
-            return None, "flex: full cudagraphs"
+        if mode is not None and mode == CUDAGraphMode.FULL:
+            return None, "flex: full cudagraphs for prefill batches"
         return "flex", None
 
     def _ckv_schedule_layout(

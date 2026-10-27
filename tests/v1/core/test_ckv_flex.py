@@ -200,3 +200,18 @@ def test_last_segment_allocation_failure_admits_nothing(make_scheduler):
     assert out2.num_scheduled_tokens == {rid: 84}
     assert out2.ckv_segments == {rid: SEGMENTS}
     assert km.block_pool.get_num_free_blocks() == free0 - 6
+
+
+def test_flex_refused_only_under_pure_full_cudagraphs(make_scheduler):
+    """FULL_AND_PIECEWISE (vLLM's default) runs prefill batches piecewise, so
+    the sparse row is allowed; a pure FULL mode could capture it and is refused
+    (sequential path)."""
+    from vllm.config import CUDAGraphMode
+
+    for mode, steps in ((CUDAGraphMode.FULL_AND_PIECEWISE, 1), (CUDAGraphMode.FULL, 3)):
+        scheduler = flex_scheduler(make_scheduler)
+        scheduler.vllm_config.compilation_config.cudagraph_mode = mode
+        req = add_planned_request(scheduler)
+        outs = run_prefill(scheduler, req)
+        assert len(outs) == steps, mode
+        assert (outs[0].ckv_segments is not None) == (steps == 1)
