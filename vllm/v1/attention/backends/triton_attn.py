@@ -3,7 +3,7 @@
 """High-Performance Triton-only Attention layer."""
 
 from dataclasses import dataclass, replace
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 
@@ -30,6 +30,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends import ckv_sparse_attn
 from vllm.v1.attention.backends.utils import (
     compute_mm_prefix_range_tensor,
     get_kv_cache_layout,
@@ -96,6 +97,9 @@ class TritonAttentionMetadata:
     mm_prefix_range_tensor: torch.Tensor | None = None
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    # ComposableKV single-row layout (V-COMP-9): see ckv_sparse_attn.
+    ckv_sparse: Any | None = None
+    ckv_sparse_token_idx: torch.Tensor | None = None
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -266,6 +270,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             persistent_prefix_lens.copy_(rswa_prefix_lens[:num_reqs])
             attn_metadata.rswa_prefix_lens = persistent_prefix_lens
             attn_metadata.rswa_window = self.rswa_window
+
+        if common_attn_metadata.ckv_sparse_req_indices:
+            assert not use_cascade
+            attn_metadata.ckv_sparse, attn_metadata.ckv_sparse_token_idx = (
+                ckv_sparse_attn.build(self, common_attn_metadata)
+            )
 
         return attn_metadata
 
@@ -746,6 +756,10 @@ class TritonAttentionImpl(AttentionImpl):
             ),
         )
 
+        if attn_metadata.ckv_sparse is not None:
+            ckv_sparse_attn.forward(
+                self, layer, query, kv_cache, attn_metadata, output
+            )
         return output
 
     def _pth_key_value_caches(

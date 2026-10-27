@@ -419,6 +419,11 @@ class FlexAttentionMetadata:
     # generated tokens. Both must be set to enable.
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
+    # ComposableKV single-row layout (V-COMP-9): per-query-token logical
+    # positions. Rows whose tokens sit at disjoint prompt positions cannot
+    # derive them from decode_offset + local index; the causal mask and the
+    # block pruning use these instead. Padded past num_actual_tokens.
+    q_positions: torch.Tensor | None = None
 
     @cached_property
     def logical_block_ids(self):
@@ -457,8 +462,11 @@ class FlexAttentionMetadata:
         is_valid = live_block & within_upper_bound & within_lower_bound
 
         # Convert physical query indices to logical indices
-        local_q_idx = q_idx - self.query_start_loc[q_req]
-        logical_q_idx = local_q_idx + self.decode_offset[q_req]
+        if self.q_positions is not None:
+            logical_q_idx = self.q_positions[q_idx]
+        else:
+            local_q_idx = q_idx - self.query_start_loc[q_req]
+            logical_q_idx = local_q_idx + self.decode_offset[q_req]
 
         return is_valid, logical_q_idx, logical_kv_idx
 
@@ -744,11 +752,16 @@ class FlexAttentionMetadata:
             token_indices = torch.arange(
                 self.doc_ids.shape[0], device=device, dtype=torch.long
             )
-            logical_q_idx = (
-                token_indices
-                - self.query_start_loc[self.doc_ids]
-                + self.decode_offset[self.doc_ids]
-            )
+            if self.q_positions is not None:
+                logical_q_idx = self.q_positions[: token_indices.shape[0]].to(
+                    torch.long
+                )
+            else:
+                logical_q_idx = (
+                    token_indices
+                    - self.query_start_loc[self.doc_ids]
+                    + self.decode_offset[self.doc_ids]
+                )
             block_starts = self.logical_block_ids * self.block_size
             block_ends = block_starts + self.block_size
 
@@ -1152,6 +1165,11 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             mm_prefix_range=common_attn_metadata.mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
             rswa_window=self.rswa_window,
+            q_positions=(
+                common_attn_metadata.positions
+                if common_attn_metadata.ckv_sparse_req_indices
+                else None
+            ),
         )
 
         # Pre-build block_mask so it is ready before CUDA graph capture.

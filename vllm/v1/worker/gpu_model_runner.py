@@ -222,6 +222,7 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
+from vllm.v1.worker import ckv_sparse
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -574,6 +575,8 @@ class GPUModelRunner(
         # Multi-modal data support
         self.mm_registry = MULTIMODAL_REGISTRY
         self.uses_mrope = model_config.uses_mrope
+        # ComposableKV single-row rows of the step being prepared (V-COMP-9).
+        self._ckv_sparse_rows: list[tuple[int, list[tuple[int, int]]]] = []
         self.uses_xdrope_dim = model_config.uses_xdrope_dim
         self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
             model_config
@@ -2050,6 +2053,20 @@ class GPUModelRunner(
             self.input_batch.num_computed_tokens_cpu[req_indices]
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
+        # ComposableKV single-row layout (V-COMP-9): rows whose tokens sit at
+        # the positions of their prompt segments, not at num_computed + i.
+        self._ckv_sparse_rows = ckv_sparse.sparse_rows(
+            scheduler_output, self.input_batch.req_ids[:num_reqs]
+        )
+        if self._ckv_sparse_rows:
+            assert not self.uses_mrope, "single-row layout needs 1-D positions"
+            ckv_sparse.apply_mrv1(
+                self._ckv_sparse_rows,
+                cu_num_tokens,
+                self.input_batch.num_computed_tokens_cpu,
+                positions_np,
+                self.query_pos.np,
+            )
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -2145,6 +2162,8 @@ class GPUModelRunner(
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
+        for i, segments in self._ckv_sparse_rows:
+            self.optimistic_seq_lens_cpu[i] = ckv_sparse.end_of(segments)
 
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
@@ -2250,6 +2269,15 @@ class GPUModelRunner(
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
         self.seq_lens[num_reqs:].fill_(0)
+        if self._ckv_sparse_rows:
+            # The row's sequence ends at its last segment, past the spliced
+            # PI tokens that num_computed + num_scheduled does not count.
+            rows_idx = [i for i, _ in self._ckv_sparse_rows]
+            self.seq_lens[rows_idx] = torch.tensor(
+                [ckv_sparse.end_of(s) for _, s in self._ckv_sparse_rows],
+                dtype=self.seq_lens.dtype,
+                device=self.device,
+            )
 
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
@@ -2526,6 +2554,11 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
             mm_req_doc_ranges=req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
+            ckv_sparse_req_indices=(
+                [i for i, _ in self._ckv_sparse_rows]
+                if self._ckv_sparse_rows and not for_cudagraph_capture
+                else None
+            ),
         )
 
         if self.dcp_world_size > 1:
@@ -6189,6 +6222,7 @@ class GPUModelRunner(
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                self._ckv_sparse_rows = []  # a dummy run has no scheduled rows
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,

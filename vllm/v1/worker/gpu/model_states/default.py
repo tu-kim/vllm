@@ -183,5 +183,6 @@ class DefaultModelState(ModelState):
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            ckv_sparse_req_indices=input_batch.ckv_sparse_req_indices,
         )
         return attn_metadata

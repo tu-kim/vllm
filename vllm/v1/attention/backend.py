@@ -523,6 +523,12 @@ class CommonAttentionMetadata:
     at the current decode run's last full-state write. write_pos counts from
     here, so a preemption-resumed request re-anchors past the prompt boundary."""
 
+    ckv_sparse_req_indices: list[int] | None = None
+    """ComposableKV single-row layout (V-COMP-9): batch indices of the rows
+    whose query tokens sit at the disjoint positions given by ``positions``
+    (not ``num_computed_tokens + i``); their causal mask is by position. None
+    when the batch has no such row."""
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None

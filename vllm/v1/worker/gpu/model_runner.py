@@ -97,6 +97,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.ec_connector import get_ec_connector
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
+from vllm.v1.worker import ckv_sparse
 from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
@@ -1221,6 +1222,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_buffers.seq_lens,
         )
         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+        # ComposableKV single-row layout (V-COMP-9): rows whose tokens sit at
+        # the positions of their prompt segments, not at num_computed + i.
+        ckv_rows = ckv_sparse.sparse_rows(scheduler_output, req_ids)
+        ckv_sparse_req_indices = None
+        if ckv_rows:
+            assert not self.model_config.uses_mrope, (
+                "single-row layout needs 1-D positions"
+            )
+            ckv_sparse_req_indices = ckv_sparse.apply_mrv2(
+                ckv_rows,
+                query_start_loc_np,
+                idx_mapping_np,
+                self.input_buffers.positions,
+                self.input_buffers.seq_lens,
+                self.input_buffers.input_ids,
+                self.req_states.all_token_ids.gpu,
+            )
 
         dcp_local_seq_lens = None
         if self.use_dcp:
@@ -1258,6 +1276,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_scheduled_tokens_upper_bound,
             out=seq_lens_cpu_upper_bound_np[:num_reqs],
         )
+        for i, segments in ckv_rows:
+            seq_lens_cpu_upper_bound_np[i] = ckv_sparse.end_of(segments)
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
         max_seq_len_np = None
@@ -1307,6 +1327,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if adaptive_verification is not None
                 else None
             ),
+            ckv_sparse_req_indices=ckv_sparse_req_indices,
         )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
 

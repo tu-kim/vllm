@@ -5,7 +5,7 @@
 import copy
 import functools
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import torch
@@ -30,6 +30,7 @@ from vllm.v1.attention.backends.fa_utils import (
     is_fa_version_supported,
     is_flash_attn_varlen_func_available,
 )
+from vllm.v1.attention.backends import ckv_sparse_attn
 from vllm.v1.attention.backends.utils import (
     fill_mm_prefix_query_ranges,
     get_dcp_local_seq_lens,
@@ -301,6 +302,12 @@ class FlashAttentionMetadata:
     rswa_prefix_lens: torch.Tensor | None = None
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
+
+    # ComposableKV single-row layout (V-COMP-9): FlexAttention metadata for
+    # the batch's sparse rows and the indices of their tokens; the forward
+    # recomputes those rows with it (see ckv_sparse_attn).
+    ckv_sparse: Any | None = None
+    ckv_sparse_token_idx: torch.Tensor | None = None
 
 
 def _get_sliding_window_configs(
@@ -779,6 +786,12 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             attn_metadata.rswa_window = self.rswa_window
             attn_metadata.rswa_window_tensor = self.persistent_rswa_window_tensor
 
+        if common_attn_metadata.ckv_sparse_req_indices:
+            assert self.dcp_world_size == 1 and not use_cascade
+            attn_metadata.ckv_sparse, attn_metadata.ckv_sparse_token_idx = (
+                ckv_sparse_attn.build(self, common_attn_metadata)
+            )
+
         return attn_metadata
 
     def update_block_table(
@@ -1144,6 +1157,10 @@ class FlashAttentionImpl(AttentionImpl):
                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                     aux_tensors=rswa_aux or mm_aux,
                 )
+                if attn_metadata.ckv_sparse is not None:
+                    ckv_sparse_attn.forward(
+                        self, layer, query, kv_cache, attn_metadata, output
+                    )
                 return output
 
         # Cascade attention (rare case).
