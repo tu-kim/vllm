@@ -285,6 +285,10 @@ class Scheduler(SchedulerInterface):
         # One-step layout (V-COMP-8): ids of the pseudo-request rows emitted
         # by the last schedule(); they go out in the next step's finished set.
         self._ckv_pseudo_req_ids: set[str] = set()
+        # Single-row layout (V-COMP-9, "flex"): request id -> the computed
+        # boundary after this step's segments (num_scheduled_tokens counts
+        # only the recomputed tokens, not the spliced PI between them).
+        self._ckv_segment_ends: dict[str, int] = {}
         self._ckv_refusal_logged: set[str] = set()
         # Pseudo rows read blocks of the same forward through the parent's
         # table; only full-attention managers never null blocks by position.
@@ -530,6 +534,8 @@ class Scheduler(SchedulerInterface):
         num_scheduled_tokens: dict[str, int] = {}
         # ComposableKV one-step layout: parent req_id -> its pseudo rows.
         ckv_pseudo_reqs: dict[str, list[NewRequestData]] = {}
+        # ComposableKV single-row layout: req_id -> [(start, len)] of this step.
+        ckv_segments: dict[str, list[tuple[int, int]]] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
@@ -599,7 +605,8 @@ class Scheduler(SchedulerInterface):
             # segment the walk stops at (the last one, or the first the budget
             # cuts or uses up) is the request's own row.
             ckv_rows: list[tuple[int, int]] = []
-            if self._ckv_one_step_applies(request):
+            ckv_mode = self._ckv_one_step_mode(request)
+            if ckv_mode is not None:
                 num_pseudo = sum(len(v) for v in ckv_pseudo_reqs.values())
                 walk_budget = min(token_budget, input_budget - draft_slots)
                 if 0 < self.scheduler_config.long_prefill_token_threshold < walk_budget:
@@ -607,7 +614,10 @@ class Scheduler(SchedulerInterface):
                 spliced_blocks, ckv_rows = self._ckv_schedule_layout(
                     request,
                     walk_budget,
-                    self.max_num_running_reqs
+                    # "flex": every segment goes into the request's one row.
+                    request.num_prompt_tokens
+                    if ckv_mode == "flex"
+                    else self.max_num_running_reqs
                     - len(self.running)
                     - self.num_waiting_for_streaming_input
                     - num_pseudo,
@@ -737,6 +747,8 @@ class Scheduler(SchedulerInterface):
                             token_budget += restored
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
+                            ckv_segments.pop(preempted_req_id, None)
+                            self._ckv_segment_ends.pop(preempted_req_id, None)
                             # Its pseudo rows (one-step layout) go with it.
                             for pseudo in ckv_pseudo_reqs.pop(preempted_req_id, ()):
                                 restored = num_scheduled_tokens.pop(pseudo.req_id)
@@ -786,7 +798,17 @@ class Scheduler(SchedulerInterface):
             token_budget -= num_new_tokens
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
-            if ckv_rows:
+            if ckv_rows and ckv_mode == "flex":
+                segments = ckv_rows + [(request.num_computed_tokens, num_new_tokens)]
+                ckv_segments[request_id] = segments
+                num_scheduled_tokens[request_id] = sum(n for _, n in segments)
+                self._ckv_segment_ends[request_id] = (
+                    request.num_computed_tokens + num_new_tokens
+                )
+                # The runner sees the row start (CachedRequestData); the walk
+                # left the count at the last segment for its allocation.
+                request.num_computed_tokens = segments[0][0]
+            elif ckv_rows:
                 pseudo_rows = self._ckv_make_pseudo_rows(request, ckv_rows)
                 ckv_pseudo_reqs[request_id] = pseudo_rows
                 for pseudo, (_, n) in zip(pseudo_rows, ckv_rows):
@@ -1147,6 +1169,16 @@ class Scheduler(SchedulerInterface):
                     # avoid deadlock and predictable preemptions.
                     reserved_blocks = self._inflight_prefill_reserved_blocks()
 
+                # ComposableKV single-row layout (V-COMP-9): admission walks
+                # the whole plan after this first chunk, so its blocks are
+                # cached by the last segment's allocation (or not at all).
+                ckv_flex_admit = (
+                    not load_kv_async
+                    and num_new_tokens > 0
+                    and num_computed_tokens + num_new_tokens < request.num_tokens
+                    and self._ckv_one_step_mode(request) == "flex"
+                )
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -1154,7 +1186,7 @@ class Scheduler(SchedulerInterface):
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
                     num_external_computed_tokens=num_external_computed_tokens,
-                    delay_cache_blocks=load_kv_async,
+                    delay_cache_blocks=load_kv_async or ckv_flex_admit,
                     num_encoder_tokens=num_encoder_tokens,
                     full_sequence_must_fit=self.scheduler_reserve_full_isl,
                     reserved_blocks=reserved_blocks,
@@ -1169,6 +1201,25 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
                     break
+
+                ckv_admit_segments: list[tuple[int, int]] | None = None
+                if ckv_flex_admit:
+                    walk_budget = min(
+                        token_budget, input_budget - draft_slots
+                    ) - num_new_tokens
+                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold - num_new_tokens < walk_budget:
+                        walk_budget = threshold - num_new_tokens
+                    ckv_admit_segments = self._ckv_admit_layout(
+                        request, num_computed_tokens, num_new_tokens, walk_budget
+                    )
+                    if ckv_admit_segments is None:
+                        # The walk's own row could not be allocated: nothing of
+                        # this request is kept (the walk never caches blocks).
+                        if request.has_encoder_inputs:
+                            self.encoder_cache_manager.free(request)
+                        break
+                    num_new_tokens = sum(n for _, n in ckv_admit_segments)
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -1255,8 +1306,15 @@ class Scheduler(SchedulerInterface):
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
                     ] * self.num_spec_tokens
+                computed_after = num_computed_tokens + num_new_tokens
+                if ckv_admit_segments is not None:
+                    ckv_segments[request_id] = ckv_admit_segments
+                    last_start, last_len = ckv_admit_segments[-1]
+                    computed_after = last_start + last_len
+                    self._ckv_segment_ends[request_id] = computed_after
+                    self._ckv_resync_req_ids.discard(request_id)
                 # Only track requests that will still be prefilling after this chunk.
-                if num_computed_tokens + num_new_tokens < request.num_tokens:
+                if computed_after < request.num_tokens:
                     self._inflight_prefills.add(request)
                 # Encoder-related.
                 if encoder_inputs_to_schedule:
@@ -1302,7 +1360,7 @@ class Scheduler(SchedulerInterface):
         num_common_prefix_blocks = [0] * len(self.kv_cache_config.kv_cache_groups)
         with record_function_or_nullcontext("schedule: get_num_common_prefix_blocks"):
             # Pseudo rows share their parent's blocks: keep cascade attention off.
-            if self.running and not ckv_pseudo_reqs:
+            if self.running and not ckv_pseudo_reqs and not ckv_segments:
                 any_request_id = self.running[0].request_id
                 num_common_prefix_blocks = (
                     self.kv_cache_manager.get_num_common_prefix_blocks(any_request_id)
@@ -1341,6 +1399,9 @@ class Scheduler(SchedulerInterface):
                 scheduled_spec_decode_tokens,
                 req_to_new_blocks,
             )
+        # A sparse row advances the runner's own computed count by its token
+        # count, not to the segment end: the next step reloads it (MRV2).
+        self._ckv_resync_req_ids.update(ckv_segments)
 
         # Record the request ids that were scheduled in this step (MRV1-only).
         if not self.use_v2_model_runner:
@@ -1411,6 +1472,7 @@ class Scheduler(SchedulerInterface):
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+            ckv_segments=ckv_segments or None,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1479,6 +1541,7 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         self._inflight_prefills.discard(request)
         self._ckv_resync_req_ids.discard(request.request_id)
+        self._ckv_segment_ends.pop(request.request_id, None)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
         if request.spec_token_ids:
@@ -1519,7 +1582,12 @@ class Scheduler(SchedulerInterface):
             if req_id in pseudo_req_ids:
                 continue  # one-step pseudo row: the parent's count covers it
             request = self.requests[req_id]
-            request.num_computed_tokens += num_scheduled_token
+            segment_end = self._ckv_segment_ends.pop(req_id, None)
+            if segment_end is not None:
+                # Single-row layout: the row skipped the spliced PI tokens.
+                request.num_computed_tokens = segment_end
+            else:
+                request.num_computed_tokens += num_scheduled_token
             request.num_in_flight_tokens += num_scheduled_token
             if self.defer_block_free:
                 # Record the in-flight step, to fence deferred block freeing.
@@ -1678,31 +1746,41 @@ class Scheduler(SchedulerInterface):
             return capped
         return num_new_tokens
 
-    def _ckv_one_step_applies(self, request: Request) -> bool:
-        """Whether the one-step layout (V-COMP-8) may be used for this
-        request in this step. Conservative: anything that gives a row extra
-        semantics (drafts, encoder inputs, pooling, prompt logprobs, prompt
-        embeds, mamba alignment, overlapping batches) or a KV cache manager
-        that frees blocks by position (sliding window, chunked local) keeps
-        the sequential path."""
-        why = self._ckv_one_step_refusal(request)
+    def _ckv_one_step_mode(self, request: Request) -> str | None:
+        """The one-step layout to use for this request in this step: "rows"
+        (V-COMP-8, pseudo-request rows), "flex" (V-COMP-9, one sparse row) or
+        None. Conservative: anything that gives a row extra semantics (drafts,
+        encoder inputs, pooling, prompt logprobs, prompt embeds, mamba
+        alignment, overlapping batches) or a KV cache manager that frees
+        blocks by position (sliding window, chunked local) keeps the
+        sequential path."""
+        mode, why = self._ckv_one_step_refusal(request)
         if why is None:
-            return True
+            return mode
         if why != "not requested" and request.request_id not in self._ckv_refusal_logged:
             self._ckv_refusal_logged.add(request.request_id)
             logger.info("ckv one-step refused for %s: %s", request.request_id, why)
-        return False
+        return None
 
-    def _ckv_one_step_refusal(self, request: Request) -> str | None:
-        """None when the one-step layout may be used, else the reason."""
+    def _ckv_one_step_applies(self, request: Request) -> bool:
+        return self._ckv_one_step_mode(request) is not None
+
+    def _ckv_one_step_refusal(self, request: Request) -> tuple[str | None, str | None]:
+        """(mode, None) when a one-step layout may be used, else (None, reason)."""
+        mode, why = self._ckv_one_step_refusal_reason(request)
+        return (mode, None) if why is None else (None, why)
+
+    def _ckv_one_step_refusal_reason(
+        self, request: Request
+    ) -> tuple[str | None, str | None]:
         if self.connector is None or self.kv_cache_manager.pi_pool is None:
-            return "no connector / PI pool"
+            return None, "no connector / PI pool"
         if not self._ckv_full_attention_only:
-            return "non-full-attention KV cache group"
+            return None, "non-full-attention KV cache group"
         if request.num_computed_tokens >= request.num_prompt_tokens:
-            return "not requested"  # decoding
+            return None, "not requested"  # decoding
         if request.prompt_token_ids is None or request.prompt_embeds is not None:
-            return "prompt embeds"  # a pseudo row carries token ids only
+            return None, "prompt embeds"  # a pseudo row carries token ids only
         checks = (
             ("spec decode", self.num_spec_tokens > 0 or bool(request.spec_token_ids)),
             ("prefill lookahead", self.num_prefill_lookahead > 0),
@@ -1720,11 +1798,20 @@ class Scheduler(SchedulerInterface):
         )
         for name, hit in checks:
             if hit:
-                return name
-        # Exactly True: a Mock connector (vLLM's own tests) is truthy.
-        if self.connector.ckv_one_step(request) is not True:
-            return "not requested"
-        return None
+                return None, name
+        # Exactly True / "flex": a Mock connector (vLLM's own tests) is truthy.
+        requested = self.connector.ckv_one_step(request)
+        if requested is True:
+            return "rows", None
+        if requested != "flex":
+            return None, "not requested"
+        # A sparse row carries per-token positions: one position per token.
+        if self.vllm_config.model_config.uses_mrope:
+            return None, "flex: M-RoPE positions"
+        mode = self.vllm_config.compilation_config.cudagraph_mode
+        if mode is not None and mode.has_full_cudagraphs():
+            return None, "flex: full cudagraphs"
+        return "flex", None
 
     def _ckv_schedule_layout(
         self, request: Request, budget: int, row_budget: int
@@ -1803,6 +1890,62 @@ class Scheduler(SchedulerInterface):
             # (MRV2 keeps its own device-side copy); see CachedRequestData.
             self._ckv_resync_req_ids.add(request.request_id)
         return (km.create_kv_cache_blocks((blocks,)) if blocks else None), rows
+
+    def _ckv_admit_layout(
+        self,
+        request: Request,
+        num_computed_tokens: int,
+        first_len: int,
+        budget: int,
+    ) -> list[tuple[int, int]] | None:
+        """Single-row layout at admission (V-COMP-9): the first chunk
+        [num_computed, +first_len) is allocated already (caching delayed);
+        walk the rest of the plan from its end, splicing PI segments and
+        allocating the recompute segments that fit, then allocate the
+        segment the walk stops at as the row's last segment -- that
+        allocation caches every block of the request up to its end. Returns
+        the segments of this step, or None when the last segment could not
+        be allocated (the request's blocks are freed; nothing was cached).
+        request.num_computed_tokens is left as it was."""
+        saved = request.num_computed_tokens
+        request.num_computed_tokens = num_computed_tokens + first_len
+        segments = [(num_computed_tokens, first_len)]
+        if budget <= 0:
+            request.num_computed_tokens = saved
+            return segments
+        _, rows = self._ckv_schedule_layout(
+            request, budget, request.num_prompt_tokens
+        )
+        segments.extend(rows)
+        budget -= sum(n for _, n in rows)
+        own_start = request.num_computed_tokens
+        own = request.num_tokens - own_start
+        if own > budget:
+            own = budget
+        own = self._ckv_cap_prefill(request, own)
+        own = min(
+            own,
+            self.max_model_len - own_start - self.num_sampled_tokens_per_step,
+        )
+        if own <= 0:
+            # The walk stopped where nothing can be computed this step (the
+            # budget is used up): the first chunk alone is the row.
+            request.num_computed_tokens = saved
+            if rows:
+                self.kv_cache_manager.free(request)
+                self._ckv_resync_req_ids.discard(request.request_id)
+                return None
+            return segments
+        new_blocks = self.kv_cache_manager.allocate_slots(
+            request, own, num_lookahead_tokens=self.num_lookahead_tokens
+        )
+        request.num_computed_tokens = saved
+        if new_blocks is None:
+            self.kv_cache_manager.free(request)
+            self._ckv_resync_req_ids.discard(request.request_id)
+            return None
+        segments.append((own_start, own))
+        return segments
 
     def _ckv_make_pseudo_rows(
         self, request: Request, rows: list[tuple[int, int]]
@@ -2763,6 +2906,7 @@ class Scheduler(SchedulerInterface):
 
         self._inflight_prefills.discard(request)
         self._ckv_resync_req_ids.discard(request.request_id)
+        self._ckv_segment_ends.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

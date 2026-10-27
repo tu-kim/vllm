@@ -274,6 +274,11 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # ComposableKV single-row layout (V-COMP-9): req_id -> the (start, len)
+    # prompt segments its row computes this step, in position order; the
+    # tokens between them are spliced PI-KV. Absent for every other request.
+    ckv_segments: dict[str, list[tuple[int, int]]] | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(
