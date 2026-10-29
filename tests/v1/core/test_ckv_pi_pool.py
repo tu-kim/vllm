@@ -182,3 +182,26 @@ def test_pi_blocks_in_prefix_cache_follow_the_entry():
     assert bp.cached_block_hash_to_block.get_one_block(h1) is None
     assert bp.cached_block_hash_to_block.get_one_block(h2) is None
     assert blk.block_hash is None
+
+
+def test_t12_1_protect_find_by_hash_and_chunk_offset():
+    """F12 (V-POOL-7): allocate(protect=) never evicts the protected entry; find_by_hash
+    lists loaded entries of a chunk at any position (MRU first); chunk_offset is kept."""
+    pool = PiPool(first_block_id=0, num_blocks=8, block_size=16)
+    src = pool.allocate(PiKey("h", 0), 64, chunk_offset=0)   # 4 blocks, whole chunk at position 0
+    assert src is not None and src.chunk_offset == 0 and src.covers(16, 48) and not src.covers(16, 64)
+    src.loaded = True
+    other = pool.allocate(PiKey("x", 10), 32)                 # 2 blocks
+    other.loaded = True
+    assert pool.get_num_free_blocks() == 2
+    # 3 blocks needed: without protection the LRU source would be evicted
+    assert pool.allocate(PiKey("h", 100), 48, chunk_offset=16, protect={PiKey("h", 0)}) is not None
+    assert pool.lookup(PiKey("h", 0)) is not None and pool.lookup(PiKey("x", 10)) is None
+    assert [e.key.offset for e in pool.find_by_hash("h")] == [0]   # the new entry is not loaded yet
+    pool.entries[PiKey("h", 100)].loaded = True
+    found = pool.find_by_hash("h")
+    assert sorted(e.key.offset for e in found) == [0, 100]
+    assert found[0].last_used >= found[-1].last_used                # most recently used first
+    # protection that leaves too little room: nothing evicted, None
+    assert pool.allocate(PiKey("y", 0), 128, protect={PiKey("h", 0)}) is None
+    assert pool.lookup(PiKey("h", 0)) is not None

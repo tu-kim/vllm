@@ -43,6 +43,13 @@ class PiEntry:
     last_used: float = field(default_factory=time.monotonic)
     # Set once the worker has copied the KV into the blocks.
     loaded: bool = False
+    # Which chunk tokens the blocks hold: [chunk_offset, chunk_offset + num_tokens)
+    # (the link cut k' for a spliced entry, 0 for a prefetched whole chunk).
+    # F12 (V-POOL-7): lets another position reuse this entry by re-rotation.
+    chunk_offset: int = 0
+
+    def covers(self, chunk_offset: int, num_tokens: int) -> bool:
+        return self.chunk_offset <= chunk_offset and chunk_offset + num_tokens <= self.chunk_offset + self.num_tokens
 
     @property
     def ref_cnt(self) -> int:
@@ -91,19 +98,27 @@ class PiPool:
         """Unreferenced entries, least recently used first."""
         return sorted((e for e in self.entries.values() if e.ref_cnt == 0), key=lambda e: e.last_used)
 
+    def find_by_hash(self, chunk_hash: str) -> list[PiEntry]:
+        """Loaded entries of a chunk at any position, most recently used first
+        (F12: sources for re-rotation)."""
+        return sorted((e for e in self.entries.values() if e.key.chunk_hash == chunk_hash and e.loaded),
+                      key=lambda e: -e.last_used)
+
     # ---- lifecycle
-    def allocate(self, key: PiKey, num_tokens: int) -> PiEntry | None:
+    def allocate(self, key: PiKey, num_tokens: int, chunk_offset: int = 0,
+                 protect: set[PiKey] | None = None) -> PiEntry | None:
         """Reserve blocks for a new entry. Evicts unreferenced entries, least
         recently used first, until the blocks fit. Returns None (and evicts
         nothing) if the referenced entries alone leave too little room, or if
         the key already exists. The blocks carry only the entry's own reference;
-        the caller adds the request's via BlockPool.touch."""
+        the caller adds the request's via BlockPool.touch. Entries in `protect`
+        are never victims (F12: the re-rotation source of this very entry)."""
         if key in self.entries:
             return None
         need = self.num_blocks_for(num_tokens)
         if need > self.num_blocks:
             return None
-        victims = self.evictable()
+        victims = [v for v in self.evictable() if not protect or v.key not in protect]
         if need > self.get_num_free_blocks() + sum(len(v.blocks) for v in victims):
             return None
         for victim in victims:
@@ -114,7 +129,7 @@ class PiPool:
         for b in blocks:
             assert b.ref_cnt == 0
             b.ref_cnt = 1
-        entry = PiEntry(key, num_tokens, blocks)
+        entry = PiEntry(key, num_tokens, blocks, chunk_offset=chunk_offset)
         self.entries[key] = entry
         self.events.append(PiEvent("stored", key, num_tokens))
         return entry
